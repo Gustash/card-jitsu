@@ -1,0 +1,8 @@
+CREATE TABLE challenges (
+  id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+  challenger VARCHAR(255) NOT NULL,
+  challenged VARCHAR(255) NOT NULL,
+  accepted BOOLEAN NOT NULL DEFAULT FALSE,
+  winner VARCHAR(255),
+  UNIQUE(challenger, challenged)
+)

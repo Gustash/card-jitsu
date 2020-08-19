@@ -1,2 +1,9 @@
+# Build Files
 /target
+
+# Env Files
 .env
+
+# Database Files
+*.db
+*.db-*
