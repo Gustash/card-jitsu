@@ -1,60 +1,55 @@
 use crate::db;
-use crate::models::{Challenge, ChallengeStatus};
+use crate::models::Challenge;
 use crate::result::*;
+use crate::utils;
 use serenity::model::channel::Message;
 use serenity::prelude::*;
 use serenity::utils::MessageBuilder;
-use sqlx::SqlitePool;
+use sqlx::{Done, SqlitePool};
 
 pub async fn handle_challenge(
     ctx: &Context,
     msg: &Message,
     conn: &SqlitePool,
 ) -> Result<(), Error> {
-    let mention_error = match msg.mentions.len() {
-        len if len == 0 => Some("You need to challenge at least one user"),
-        len if len > 1 => Some("You can only challenge one user at a time"),
-        _ => None,
-    };
-
-    if let Some(error_msg) = mention_error {
-        if let Err(error) = msg.channel_id.say(&ctx.http, error_msg).await {
-            return Err(Error::Serenity(error));
+    {
+        let mention_error = match msg.mentions.len() {
+            len if len == 0 => Some("You need to challenge at least one user"),
+            len if len == 1 => {
+                if msg.mentions[0] == msg.author {
+                    Some("You cannot challenge yourself, silly!")
+                } else {
+                    None
+                }
+            }
+            len if len > 1 => Some("You can only challenge one user at a time"),
+            _ => None,
         };
-        return Err(Error::HandleCommand(error_msg.to_string()));
+
+        if let Some(error_msg) = mention_error {
+            utils::send_message_to_channel(ctx, msg, error_msg).await?;
+            return Err(Error::HandleCommand(error_msg.to_string()));
+        }
     }
 
     let mention = &msg.mentions[0];
 
     match db::create_challenge(conn, msg.author.id.as_u64(), mention.id.as_u64()).await {
-        Ok(_) => match handle_challenge_success(ctx, msg).await {
-            Ok(_) => Ok(()),
-            Err(error) => Err(Error::Serenity(error)),
-        },
-        Err(error) => {
-            println!("DB error: {}", error);
-            Err(handle_challenge_failure(ctx, msg, conn, Error::SQLX(error)).await)
-        }
+        Ok(_) => Ok(handle_challenge_success(ctx, msg).await?),
+        Err(error) => Err(handle_challenge_failure(ctx, msg, conn, error).await),
     }
 }
 
-async fn handle_challenge_success(ctx: &Context, msg: &Message) -> Result<(), serenity::Error> {
+async fn handle_challenge_success(ctx: &Context, msg: &Message) -> Result<(), Error> {
     let mention = &msg.mentions[0];
 
-    if let Err(error) = msg
-        .channel_id
-        .say(
-            &ctx.http,
-            MessageBuilder::new()
-                .mention(&msg.author)
-                .push(" has challenged ")
-                .mention(mention)
-                .build(),
-        )
-        .await
-    {
-        return Err(error);
-    };
+    let content = MessageBuilder::new()
+        .mention(&msg.author)
+        .push(" has challenged ")
+        .mention(mention)
+        .build();
+
+    utils::send_message_to_channel(ctx, msg, content).await?;
 
     Ok(())
 }
@@ -77,11 +72,11 @@ async fn handle_challenge_failure(
             } else {
                 "a pending "
             })
-            .push("with ")
+            .push("challenge with ")
             .mention(mention)
             .build(),
         Err(_error) => {
-            error = Some(Error::SQLX(_error));
+            error = Some(_error);
 
             MessageBuilder::new()
                 .push("There was a problem challenging ")
@@ -90,8 +85,8 @@ async fn handle_challenge_failure(
         }
     };
 
-    if let Err(_error) = msg.channel_id.say(&ctx.http, content).await {
-        error = Some(Error::Serenity(_error));
+    if let Err(_error) = utils::send_message_to_channel(ctx, msg, content).await {
+        error = Some(_error);
     };
 
     match error {
@@ -105,19 +100,11 @@ pub async fn handle_list_challenges(
     msg: &Message,
     conn: &SqlitePool,
 ) -> Result<(), Error> {
-    let pending_challenges =
-        match db::find_challenges(conn, msg.author.id.as_u64(), ChallengeStatus::Pending).await {
-            Ok(challenges) => challenges,
-            Err(error) => return Err(Error::SQLX(error)),
-        };
-    let ongoing_challenges =
-        match db::find_challenges(conn, msg.author.id.as_u64(), ChallengeStatus::Ongoing).await {
-            Ok(challenges) => challenges,
-            Err(error) => return Err(Error::SQLX(error)),
-        };
+    let pending_challenges = db::find_pending_challenges(conn, msg.author.id.as_u64()).await?;
+    let ongoing_challenge = db::find_active_challenge(conn, msg.author.id.as_u64()).await?;
 
     let mut message_builder = MessageBuilder::new();
-    if pending_challenges.is_empty() && ongoing_challenges.is_empty() {
+    if pending_challenges.is_empty() && ongoing_challenge.is_none() {
         message_builder.push("You don't have any pending or active challenges :cold_sweat:");
     } else {
         build_challenge_list_message(
@@ -128,21 +115,21 @@ pub async fn handle_list_challenges(
             false,
         )
         .await;
-        build_challenge_list_message(
-            ctx,
-            &mut message_builder,
-            ongoing_challenges,
-            msg.author.id.as_u64(),
-            true,
-        )
-        .await;
+        if let Some(challenge) = ongoing_challenge {
+            build_challenge_list_message(
+                ctx,
+                &mut message_builder,
+                vec![challenge],
+                msg.author.id.as_u64(),
+                true,
+            )
+            .await;
+        }
     }
 
-    if let Err(error) = msg.channel_id.say(&ctx.http, message_builder.build()).await {
-        Err(Error::Serenity(error))
-    } else {
-        Ok(())
-    }
+    utils::send_message_to_channel(ctx, msg, message_builder.build()).await?;
+
+    Ok(())
 }
 
 async fn build_challenge_list_message(
@@ -155,35 +142,28 @@ async fn build_challenge_list_message(
     for (i, challenge) in challenges.iter().enumerate() {
         if i == 0 {
             message_builder.push_bold_line_safe(if ongoing {
-                "Ongoing Challenges:"
+                "Ongoing Challenge:"
             } else {
                 "Pending Challenges:"
             });
         }
-        let is_challenger = challenge.challenger == author_id.to_string();
-        let other_user_id = if is_challenger {
-            challenge.challenged.parse::<u64>()
+        let other_user_id = if challenge.user_one == author_id.to_string() {
+            &challenge.user_two
         } else {
-            challenge.challenger.parse::<u64>()
+            &challenge.user_one
         };
+        let other_user_id_u64 = challenge.user_two.parse::<u64>();
 
-        if let Err(_) = other_user_id {
-            println!(
-                "{} is not a valid user id",
-                if is_challenger {
-                    &challenge.challenged
-                } else {
-                    &challenge.challenger
-                }
-            );
+        if let Err(_) = other_user_id_u64 {
+            println!("{} is not a valid user id", other_user_id);
             continue;
         }
 
-        match ctx.http.get_user(other_user_id.unwrap()).await {
+        match ctx.http.get_user(other_user_id_u64.unwrap()).await {
             Ok(other_user) => {
                 message_builder
-                    .push("You have a ")
-                    .push(if ongoing { "ongoing " } else { "pending " })
+                    .push("You have ")
+                    .push(if ongoing { "an ongoing " } else { "a pending " })
                     .push("challenge with ")
                     .mention(&other_user)
                     .push_line("");
@@ -194,19 +174,19 @@ async fn build_challenge_list_message(
 }
 
 pub async fn handle_accept(ctx: &Context, msg: &Message, conn: &SqlitePool) -> Result<(), Error> {
-    match msg.mentions.len() {
-        0 => {
+    {
+        let mentions_err_message = match msg.mentions.len() {
+            0 => Some("You need to tell me whose challenge to accept"),
+            len if len > 1 => Some("You can only accept one person's challenge at a time"),
+            _ => None,
+        };
+        if let Some(err_message) = mentions_err_message {
+            utils::send_message_to_channel(ctx, msg, err_message).await?;
             return Err(Error::HandleCommand(
                 "You need to tell me whose challenge to accept".to_string(),
-            ))
+            ));
         }
-        len if len > 1 => {
-            return Err(Error::HandleCommand(
-                "You can only accept one person's challenge at a time".to_string(),
-            ))
-        }
-        _ => (),
-    };
+    }
 
     let author_id = msg.author.id.as_u64();
     let mention = &msg.mentions[0];
@@ -214,28 +194,19 @@ pub async fn handle_accept(ctx: &Context, msg: &Message, conn: &SqlitePool) -> R
 
     match db::accept_challenge(conn, mention_id, author_id).await {
         Ok(done) => {
-            // if done.changes < 1 {
-            //     if let Err(error) = msg
-            //         .channel_id
-            //         .say(&ctx.http, "There was no pending challenge")
-            //         .await
-            //     {
-            //         return Err(Error::Serenity(error));
-            //     }
-            // }
+            if done.rows_affected() < 1 {
+                let err_message = MessageBuilder::new()
+                    .push("There's no challenge to accept from ")
+                    .mention(mention)
+                    .build();
+                utils::send_message_to_channel(ctx, msg, &err_message).await?;
+                return Err(Error::HandleCommand(err_message.to_string()));
+            }
         }
         Err(error) => {
-            if let Err(error) = msg
-                .channel_id
-                .say(
-                    &ctx.http,
-                    "Chucks. I couldn't accept this challenge... :crying_cat_face:",
-                )
-                .await
-            {
-                return Err(Error::Serenity(error));
-            }
-            return Err(Error::SQLX(error));
+            let err_message = "Chucks. I couldn't accept this challenge... :crying_cat_face:";
+            utils::send_message_to_channel(ctx, msg, err_message).await?;
+            return Err(error);
         }
     }
 
@@ -246,9 +217,7 @@ pub async fn handle_accept(ctx: &Context, msg: &Message, conn: &SqlitePool) -> R
         .push("'s challenge!")
         .build();
 
-    if let Err(error) = msg.channel_id.say(&ctx.http, content).await {
-        return Err(Error::Serenity(error));
-    }
+    utils::send_message_to_channel(ctx, msg, content).await?;
 
     Ok(())
 }

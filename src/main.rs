@@ -1,84 +1,25 @@
 mod commands;
 mod db;
 mod models;
+mod prelude;
 mod result;
+mod utils;
 
-use commands::challenge;
+use commands::{challenge, game};
 use dotenv;
-use rand::Rng;
 use result::*;
 use serenity::{
     async_trait,
     model::{
-        channel::{Message, Reaction, ReactionType},
+        channel::{Message, Reaction},
         gateway::Ready,
     },
     prelude::*,
 };
 use sqlx::SqlitePool;
-use std::{env, fmt};
+use std::env;
 
 static COMMAND_PREFIX: &str = "!";
-
-enum Color {
-    RED,
-    GREEN,
-    BLUE,
-}
-
-impl fmt::Display for Color {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Color::RED => write!(f, "Red"),
-            Color::GREEN => write!(f, "Green"),
-            Color::BLUE => write!(f, "Blue"),
-        }
-    }
-}
-
-enum Element {
-    FIRE,
-    SNOW,
-    WATER,
-}
-
-impl fmt::Display for Element {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Element::FIRE => write!(f, "Fire"),
-            Element::SNOW => write!(f, "Snow"),
-            Element::WATER => write!(f, "Water"),
-        }
-    }
-}
-
-struct Card {
-    color: Color,
-    element: Element,
-    value: u8,
-}
-
-impl Card {
-    fn new() -> Self {
-        let mut rng = rand::thread_rng();
-
-        Card {
-            color: match rng.gen_range(0, 3) {
-                0 => Color::RED,
-                1 => Color::GREEN,
-                2 => Color::BLUE,
-                _ => Color::RED,
-            },
-            element: match rng.gen_range(0, 3) {
-                0 => Element::FIRE,
-                1 => Element::SNOW,
-                2 => Element::WATER,
-                _ => Element::FIRE,
-            },
-            value: rng.gen_range(1, 11),
-        }
-    }
-}
 
 struct Handler {
     conn: SqlitePool,
@@ -103,6 +44,16 @@ impl EventHandler for Handler {
                 Error::Serenity(error) => println!("Error handling command: {}", error),
                 Error::SQLX(error) => println!("DB error: {}", error),
                 Error::HandleCommand(command) => println!("Could not handle command: {}", command),
+                Error::ExistingActiveChallenge(user_id) => {
+                    let user = ctx.http.get_user(user_id).await;
+
+                    match user {
+                        Ok(user) => {
+                            println!("Error: {} already has an active challenge", user.name)
+                        }
+                        Err(error) => println!("Discord error: {}", error),
+                    }
+                }
             }
         }
     }
@@ -152,71 +103,17 @@ fn extract_command(content: &str) -> &str {
     }
 }
 
-fn deal_hand() -> Vec<Card> {
-    (1..6).map(|_| Card::new()).collect()
-}
-
 async fn handle_command(
     command: &str,
     ctx: &Context,
     msg: &Message,
     conn: &SqlitePool,
 ) -> Result<(), Error> {
-    if let Err(error) = match command {
-        "hand" => handle_hand(ctx, msg).await,
+    match command {
+        "hand" => game::handle_hand(ctx, msg).await,
         "challenge" => challenge::handle_challenge(ctx, msg, conn).await,
         "list" => challenge::handle_list_challenges(ctx, msg, conn).await,
         "accept" => challenge::handle_accept(ctx, msg, conn).await,
-        _ => return Err(Error::HandleCommand(String::from(command))),
-    } {
-        return Err(error);
-    };
-
-    Ok(())
-}
-
-async fn handle_hand(ctx: &Context, msg: &Message) -> Result<(), Error> {
-    let hand = deal_hand();
-
-    let hand_str = hand.iter().enumerate().fold(
-        String::from("You hand has the following cards:\n"),
-        |acc, (i, card)| {
-            let emoji = match i {
-                0 => ":one:",
-                1 => ":two:",
-                2 => ":three:",
-                3 => ":four:",
-                4 => ":five:",
-                _ => ":100:",
-            };
-            acc + &format!(
-                "{emoji} {color} {element} {value}\n",
-                emoji = emoji,
-                color = card.color,
-                element = card.element,
-                value = card.value
-            )
-        },
-    );
-
-    if let Err(error) = msg
-        .author
-        .direct_message(&ctx.http, |message| {
-            message.content(hand_str);
-            // message.reactions(vec![":one:", ":two:", ":three:", ":four:", ":five:"]);
-            message.reactions(vec![
-                ReactionType::Unicode(String::from("1️⃣")),
-                ReactionType::Unicode(String::from("2️⃣")),
-                ReactionType::Unicode(String::from("3️⃣")),
-                ReactionType::Unicode(String::from("4️⃣")),
-                ReactionType::Unicode(String::from("5️⃣")),
-            ]);
-            message
-        })
-        .await
-    {
-        return Err(Error::Serenity(error));
-    };
-
-    Ok(())
+        _ => Err(Error::HandleCommand(String::from(command))),
+    }
 }
