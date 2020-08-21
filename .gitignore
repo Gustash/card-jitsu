@@ -7,3 +7,6 @@
 # Database Files
 *.db
 *.db-*
+
+# macOS Files
+**/.DS_Store
